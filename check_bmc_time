@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Thomas Wagner
+"""check_bmc_time - Nagios/Icinga plugin: is the clock of a BMC (IPMI SEL time) right?
+
+The event log (SEL) of a BMC is only useful after an incident if its timestamps are right.
+The plugin reads the SEL time out of band with FreeIPMI (bmc-device --get-sel-time) and
+compares it with the clock of the monitoring server, which should be NTP synchronised.
+
+BMCs keep their clock either in UTC or in local time, and IPMI does not say which. The
+plugin compares both ways and uses the smaller difference; the output says which matched.
+"""
+import argparse
+import calendar
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+VERSION = "0.1"
+OK, WARNING, CRITICAL, UNKNOWN = 0, 1, 2, 3
+STATE = {OK: "OK", WARNING: "WARNING", CRITICAL: "CRITICAL", UNKNOWN: "UNKNOWN"}
+SEL_TIME_RE = re.compile(r"SEL Time\s*:\s*(\d\d)/(\d\d)/(\d{4})\s*-\s*(\d\d):(\d\d):(\d\d)")
+# FreeIPMI programs live in sbin, which is often not in the PATH of the monitoring user
+SBIN_DIRS = ("/usr/sbin", "/sbin", "/usr/local/sbin")
+
+
+def finish(state, text, perf=""):
+    print("BMC TIME %s - %s%s" % (STATE[state], text, " | " + perf if perf else ""))
+    sys.exit(state)
+
+
+def fmt(sec):
+    """A duration as '2d 3h 04m', '1h 02m 03s', '4m 05s' or '6s'."""
+    sec = int(round(abs(sec)))
+    d, r = divmod(sec, 86400)
+    h, r = divmod(r, 3600)
+    m, s = divmod(r, 60)
+    if d:
+        return "%dd %dh %02dm" % (d, h, m)
+    if h:
+        return "%dh %02dm %02ds" % (h, m, s)
+    if m:
+        return "%dm %02ds" % (m, s)
+    return "%ds" % s
+
+
+def find_bmc_device(given):
+    if given:
+        return given
+    found = shutil.which("bmc-device")
+    if found:
+        return found
+    for d in SBIN_DIRS:
+        path = os.path.join(d, "bmc-device")
+        if os.access(path, os.X_OK):
+            return path
+    finish(UNKNOWN, "bmc-device not found, install FreeIPMI (freeipmi-tools / freeipmi)")
+
+
+def read_password(args):
+    if args.password_file:
+        try:
+            with open(args.password_file, encoding="utf-8") as f:
+                return f.readline().rstrip("\r\n")
+        except OSError as e:
+            finish(UNKNOWN, "cannot read the password file: %s" % e.strerror)
+    return args.password
+
+
+def config_file_safe(value):
+    """freeipmi.conf separates arguments by whitespace and has # comments."""
+    return value and not re.search(r"[\s#\\]", value)
+
+
+def read_sel_time(args, password):
+    """Run bmc-device; returns (SEL time as naive epoch, mid time of the call).
+
+    Username and password go to bmc-device in a temporary configuration file (mode 0600)
+    instead of the command line, where every local user could read them in the process list.
+    """
+    cmd = [find_bmc_device(args.bmc_device), "-h", args.host, "-l", args.privilege] + args.extra.split()
+    conf = None
+    try:
+        if config_file_safe(args.user) and (not password or config_file_safe(password)):
+            fd, conf = tempfile.mkstemp(prefix="check_bmc_time.", suffix=".conf")
+            with os.fdopen(fd, "w") as f:
+                f.write("username %s\n" % args.user)
+                if password:
+                    f.write("password %s\n" % password)
+            cmd += ["--config-file=" + conf]
+        else:   # cannot be written to freeipmi.conf: fall back to the command line
+            cmd += ["-u", args.user] + (["-p", password] if password else [])
+        cmd += ["--get-sel-time"]
+        t0 = time.time()
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout)
+        except subprocess.TimeoutExpired:
+            finish(UNKNOWN, "bmc-device did not answer within %d s" % args.timeout)
+        t1 = time.time()
+    finally:
+        if conf:
+            os.unlink(conf)
+    out = (r.stdout + r.stderr).strip()
+    for secret in (password, args.user):
+        if secret:
+            out = out.replace(secret, "<hidden>")
+    m = SEL_TIME_RE.search(out)
+    if r.returncode != 0 or not m:
+        first = out.splitlines()[0][:200] if out else "no output"
+        finish(UNKNOWN, "cannot read the BMC clock (bmc-device exit %d): %s" % (r.returncode, first))
+    mo, da, ye, hh, mi, ss = (int(x) for x in m.groups())
+    return calendar.timegm((ye, mo, da, hh, mi, ss, 0, 0, 0)), (t0 + t1) / 2, \
+        "%04d-%02d-%02d %02d:%02d:%02d" % (ye, mo, da, hh, mi, ss)
+
+
+def evaluate(bmc_naive, now, warning, critical):
+    """Offset of the BMC clock in seconds and whether it keeps 'UTC' or 'local time'."""
+    diff_utc = bmc_naive - now
+    utcoff = calendar.timegm(time.localtime(now)) - int(now)     # e.g. 3600 for CET
+    diff_local = bmc_naive - utcoff - now
+    if abs(diff_local) < abs(diff_utc):
+        diff, ref = diff_local, "local time"
+    else:
+        diff, ref = diff_utc, "UTC"
+    if abs(diff) >= critical:
+        state = CRITICAL
+    elif abs(diff) >= warning:
+        state = WARNING
+    else:
+        state = OK
+    return state, diff, ref
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Check the clock of a BMC (IPMI SEL time) against this server's clock.",
+        epilog="Example: check_bmc_time -H bmc.example.com -U monitor -f /etc/nagios/bmc.secret -w 60 -c 300")
+    p.add_argument("-H", "--host", required=True, help="BMC host name or address")
+    p.add_argument("-U", "--user", required=True, help="IPMI user")
+    pw = p.add_mutually_exclusive_group()
+    pw.add_argument("-f", "--password-file", help="file whose first line is the IPMI password (recommended)")
+    pw.add_argument("-P", "--password", default="", help="IPMI password (visible in the process list of the plugin)")
+    p.add_argument("-L", "--privilege", default="user", help="IPMI privilege level (default %(default)s)")
+    p.add_argument("-w", "--warning", type=int, default=60, help="seconds of offset for WARNING (default %(default)s)")
+    p.add_argument("-c", "--critical", type=int, default=300, help="seconds of offset for CRITICAL (default %(default)s)")
+    p.add_argument("--extra", default="", metavar="OPTIONS",
+                   help="extra FreeIPMI options, e.g. '-W authcap' (some Supermicro BMCs) or '-D LAN_2_0' (iDRAC)")
+    p.add_argument("--bmc-device", metavar="PATH", help="path of bmc-device (default: search PATH and sbin)")
+    p.add_argument("-t", "--timeout", type=int, default=40, help="seconds (default %(default)s)")
+    p.add_argument("-V", "--version", action="version", version="check_bmc_time %s" % VERSION)
+    args = p.parse_args()
+    if args.warning > args.critical:
+        finish(UNKNOWN, "the warning offset must not be larger than the critical offset")
+
+    bmc_naive, now, bmc_txt = read_sel_time(args, read_password(args))
+    state, diff, ref = evaluate(bmc_naive, now, args.warning, args.critical)
+    # perfdata ranges: the offset may be negative, alert outside -w..w / -c..c
+    perf = "offset=%ds;%d:%d;%d:%d;;" % (int(round(diff)), -args.warning, args.warning, -args.critical, args.critical)
+    if abs(diff) < 2:    # the SEL time has a resolution of 1 s
+        text = "BMC clock %s (%s) in sync" % (bmc_txt, ref)
+    else:
+        text = "BMC clock %s (%s) %s %s" % (bmc_txt, ref, fmt(diff), "ahead" if diff > 0 else "behind")
+    finish(state, text, perf)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,27 @@
+# bash completion for check_bmc_time                         -*- shell-script -*-
+
+_check_bmc_time()
+{
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
+    COMPREPLY=()
+    case $prev in
+        -H | --host)
+            mapfile -t COMPREPLY < <(compgen -A hostname -- "$cur")
+            return
+            ;;
+        -f | --password-file | --bmc-device)
+            mapfile -t COMPREPLY < <(compgen -f -- "$cur")
+            return
+            ;;
+        -L | --privilege)
+            mapfile -t COMPREPLY < <(compgen -W 'user operator admin' -- "$cur")
+            return
+            ;;
+        -U | --user | -P | --password | -w | --warning | -c | --critical | -t | --timeout | --extra)
+            return
+            ;;
+    esac
+    mapfile -t COMPREPLY < <(compgen -W '-h --help -V --version -H --host -U --user -f --password-file
+        -P --password -L --privilege -w --warning -c --critical --extra --bmc-device -t --timeout' -- "$cur")
+}
+complete -F _check_bmc_time check_bmc_time
