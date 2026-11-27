@@ -66,10 +66,12 @@ class CheckBmcTime(unittest.TestCase):
     def test_warning_and_critical(self):
         rc, out = self.run_plugin(time.time() - 120, "-P", "secret")
         self.assertEqual(rc, 1, out)
-        self.assertIn("2m 00s behind", out)
+        # the SEL time is cut to whole seconds and the plugin reads the clock a moment later,
+        # so the offset may be one second off
+        self.assertRegex(out, r"2m 0[01]s behind")
         rc, out = self.run_plugin(time.time() + 70 * 86400, "-P", "secret")
         self.assertEqual(rc, 2, out)
-        self.assertIn("70d 0h 00m ahead", out)
+        self.assertRegex(out, r"(70d 0h 00m|69d 23h 59m) ahead")
 
     def test_local_time_bmc(self):
         # a BMC that keeps local time (here fixed UTC+1, "Etc/GMT-1" has no DST) is in sync
